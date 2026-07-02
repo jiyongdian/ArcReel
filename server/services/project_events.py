@@ -25,10 +25,20 @@ from lib.project_change_hints import (
     register_project_change_listener,
 )
 from lib.project_manager import ProjectManager
+from lib.script_skeleton import SKELETONS, resolve_script_kind
 
 logger = logging.getLogger(__name__)
 
 PROJECT_EVENTS_POLL_SECONDS = 0.5
+
+# 条目名词按骨架种类硬编码——用于分镜级事件标签（如「镜头「E1S01」」）。名词 i18n 化是
+# 独立议题（与 ``_diff_named_entities`` 的「角色」/「线索」同为既有硬编码形态），不在此处收敛。
+_SKELETON_ITEM_NOUNS: dict[str, str] = {
+    "segments": "分镜",
+    "scenes": "场景",
+    "shots": "镜头",
+    "video_units": "视频单元",
+}
 
 
 def _utc_now_iso() -> str:
@@ -541,29 +551,39 @@ class ProjectEventService:
         }
 
     def _normalize_script_snapshot(self, script: dict[str, Any]) -> dict[str, Any]:
+        # 取证解析：由剧本数据形状判别骨架种类（narration/drama 走 reference 时 content_mode 仍是
+        # narration/drama，二值兜底会把 ad 的 shots 与 reference 的 video_units 全部漏读——差分恒空、
+        # 分镜级事件从不发出，正是本次修复的 bug 根因）。键即条目数组键。
         content_mode = str(script.get("content_mode") or "narration")
-        raw_items = script.get("segments" if content_mode == "narration" else "scenes", [])
+        kind = resolve_script_kind(script)
+        skeleton = SKELETONS[kind]
+        raw_items = script.get(kind, [])
         if not isinstance(raw_items, list):
+            logger.warning(
+                "剧本条目字段非列表，按空快照处理 kind=%s type=%s",
+                kind,
+                type(raw_items).__name__,
+            )
             raw_items = []
-        id_field = "segment_id" if content_mode == "narration" else "scene_id"
-        chars_field = "characters_in_segment" if content_mode == "narration" else "characters_in_scene"
 
         items: dict[str, Any] = {}
         for item in raw_items:
             if not isinstance(item, dict):
                 continue
-            item_id = str(item.get(id_field) or "")
+            item_id = str(item.get(skeleton.id_field) or "")
             if not item_id:
                 continue
             assets = item.get("generated_assets")
             if not isinstance(assets, dict):
                 assets = {}
+            characters, scenes, props = self._item_entities(item, skeleton.chars_field)
             items[item_id] = {
                 "duration_seconds": item.get("duration_seconds"),
                 "segment_break": bool(item.get("segment_break")),
-                "characters": sorted(str(name) for name in item.get(chars_field, []) or []),
-                "scenes": sorted(str(name) for name in item.get("scenes", []) or []),
-                "props": sorted(str(name) for name in item.get("props", []) or []),
+                "characters": characters,
+                "scenes": scenes,
+                "props": props,
+                "shots": self._item_member_shots(item.get("shots")),
                 "image_prompt": item.get("image_prompt"),
                 "video_prompt": item.get("video_prompt"),
                 "generated_assets": {
@@ -578,8 +598,56 @@ class ProjectEventService:
             "episode": script.get("episode"),
             "title": str(script.get("title") or ""),
             "content_mode": content_mode,
+            "kind": kind,
             "items": items,
         }
+
+    @staticmethod
+    def _item_entities(item: dict[str, Any], chars_field: str | None) -> tuple[list[str], list[str], list[str]]:
+        """条目出场的 (角色, 场景, 道具) 名单（各自排序、去重）。
+
+        ``chars_field`` 非 ``None`` 时角色读逐条字段、场景/道具读顶层 ``scenes`` / ``props``；为
+        ``None``（video_units 无逐条实体字段的显式缺位，见 ``SKELETONS``）时三者均从条目
+        ``references`` 按 ``type == character/scene/prop`` 派生（与 ``status_calculator`` 同规则，
+        使 video_unit 的场景/道具引用编辑也能进入差分）。
+        """
+        if chars_field is not None:
+            chars_raw = item.get(chars_field)
+            scenes_raw = item.get("scenes")
+            props_raw = item.get("props")
+            characters = sorted({str(name) for name in chars_raw}) if isinstance(chars_raw, list) else []
+            scenes = sorted({str(name) for name in scenes_raw}) if isinstance(scenes_raw, list) else []
+            props = sorted({str(name) for name in props_raw}) if isinstance(props_raw, list) else []
+            return characters, scenes, props
+        buckets: dict[str, set[str]] = {"character": set(), "scene": set(), "prop": set()}
+        references = item.get("references")
+        if isinstance(references, list):
+            for ref in references:
+                if not isinstance(ref, dict):
+                    continue
+                name = ref.get("name")
+                if not name:
+                    continue
+                ref_type = ref.get("type")
+                target = buckets.get(ref_type) if isinstance(ref_type, str) else None
+                if target is not None:
+                    target.add(str(name))
+        return sorted(buckets["character"]), sorted(buckets["scene"]), sorted(buckets["prop"])
+
+    @staticmethod
+    def _item_member_shots(shots: Any) -> list[dict[str, Any]]:
+        """video_units 成员镜头的内容体（``text`` / ``duration``），供 ``updated`` 差分捕获镜头
+        文本或时长编辑——这些内容不落在 ``characters`` / ``duration_seconds`` 上，不纳入则单元
+        内容改动无事件。storyboard 骨架（segments/scenes/shots）条目无成员镜头子列表，返回空列表。
+        """
+        if not isinstance(shots, list):
+            return []
+        normalized: list[dict[str, Any]] = []
+        for shot in shots:
+            if not isinstance(shot, dict):
+                continue
+            normalized.append({"text": str(shot.get("text") or ""), "duration": shot.get("duration")})
+        return normalized
 
     def _diff_snapshots(
         self,
@@ -843,8 +911,8 @@ class ProjectEventService:
 
     @staticmethod
     def _build_script_item_label(item_id: str, script_meta: dict[str, Any]) -> str:
-        content_mode = str(script_meta.get("content_mode") or "narration")
-        noun = "分镜" if content_mode == "narration" else "场景"
+        kind = str(script_meta.get("kind") or "segments")
+        noun = _SKELETON_ITEM_NOUNS.get(kind, "分镜")
         return f"{noun}「{item_id}」"
 
     def _build_script_item_change(
